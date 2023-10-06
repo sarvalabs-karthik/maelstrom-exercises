@@ -47,13 +47,11 @@ func main() {
 				return err
 			}
 
-			if !found {
-				neighbours := node.NodeIDs()
+			neighbours := node.NodeIDs()
 
-				for _, neighbour := range neighbours {
-					if err := node.Send(neighbour, msg.Body); err != nil {
-						return err
-					}
+			for _, neighbour := range neighbours {
+				if err := node.Send(neighbour, msg.Body); err != nil {
+					return err
 				}
 			}
 		}
