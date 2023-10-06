@@ -7,9 +7,20 @@ import (
 	"log"
 )
 
+// multinode broadcast solution
+// 1. whenever broadcast message received
+// 2. check if node received packet already then don't broadcast or reply to it
+// 3. else send packet to all other nodes, reply to the broadcast packet with broadcast_ok message as it would have come from worker
+// optimization that are made:
+// avoided broadcast flooding
+// optimization that can be made:
+// 1. do not send packet if destination already has it
+// 2. send packet only to neighbours in topology
+
 func main() {
 	node := maelstrom.NewNode()
 	messages := make([]int, 0)
+	set := make(map[int]struct{})
 
 	node.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body map[string]any
@@ -26,12 +37,25 @@ func main() {
 
 		respBody := make(map[string]any)
 
-		messages = append(messages, int(value))
+		_, found := set[int(value)]
+		if !found {
+			set[int(value)] = struct{}{}
+			messages = append(messages, int(value))
+			respBody["type"] = "broadcast_ok"
 
-		respBody["type"] = "broadcast_ok"
+			if err := node.Reply(msg, respBody); err != nil {
+				return err
+			}
 
-		if err := node.Reply(msg, respBody); err != nil {
-			return err
+			if !found {
+				neighbours := node.NodeIDs()
+
+				for _, neighbour := range neighbours {
+					if err := node.Send(neighbour, msg.Body); err != nil {
+						return err
+					}
+				}
+			}
 		}
 
 		return nil
