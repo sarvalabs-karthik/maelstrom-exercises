@@ -18,12 +18,14 @@ import (
 // avoided broadcast flooding
 // optimization that can be made:
 // 1. do not send packet if destination already has it
-// 2. send packet only to neighbours in topology
 
 // Fault-tolerant broadcast solution
 // lets say communication is down between node n1 and n2
 // n1 can keep track of broadcast messages for which reply is not received
 // and retry sending packets every 1 second (use a goroutine which handles this
+
+// Efficient Broadcast, Part I
+// send packet only to neighbours in topology, so that no of packets in network can be reduce but this increases latency
 
 func checkIfMsgTypeMatches(msgBody json.RawMessage, expectedType string) bool {
 	var body map[string]any
@@ -55,7 +57,10 @@ type Node struct {
 	messages       []int
 	messageSet     map[int]struct{}
 	missingPackets map[string]map[float64]struct{} // map of node to array of packet to be resent at regular intervals
-	mtx            sync.Mutex
+	missingLock    sync.Mutex
+	msgLock        sync.RWMutex
+	messageSetLock sync.RWMutex
+	topology       map[string][]string
 }
 
 func newNode(node *maelstrom.Node) *Node {
@@ -64,11 +69,68 @@ func newNode(node *maelstrom.Node) *Node {
 		messages:       make([]int, 0),
 		messageSet:     make(map[int]struct{}),
 		missingPackets: make(map[string]map[float64]struct{}),
+		topology:       make(map[string][]string),
 	}
 }
 
+func (n *Node) initializeTopology(t any) {
+	topology, ok := t.(map[string]any)
+	if !ok {
+		log.Panic("neighbours are not expected type (map[string]any)")
+	}
+
+	for src, neighbours := range topology {
+		neighbours, ok := neighbours.([]interface{})
+		if !ok {
+			log.Panic("neighbours are not string list")
+		}
+
+		neigh := make([]string, 0, len(neighbours))
+
+		for _, node := range neighbours {
+			neigh = append(neigh, node.(string))
+		}
+
+		n.topology[src] = neigh
+	}
+}
+
+func (n *Node) addToMessageSet(val int) {
+	n.messageSetLock.Lock()
+	defer n.messageSetLock.Unlock()
+
+	n.messageSet[val] = struct{}{}
+}
+
+func (n *Node) hasMessage(val int) bool {
+	n.messageSetLock.RLock()
+	defer n.messageSetLock.RUnlock()
+
+	_, found := n.messageSet[val]
+
+	return found
+}
+
+func (n *Node) addToMessages(val int) {
+	n.msgLock.Lock()
+	defer n.msgLock.Unlock()
+
+	n.messages = append(n.messages, val)
+}
+
+func (n *Node) readMessages() []int {
+	n.msgLock.RLock()
+	defer n.msgLock.RUnlock()
+
+	return n.messages
+}
+
 func (n *Node) addMissingPacket(neighbour string, value float64) {
+	n.missingLock.Lock()
+	defer n.missingLock.Unlock()
+
 	log.Printf("add missing packet %s, %v, %v ", neighbour, value, len(n.missingPackets))
+
 	if _, ok := n.missingPackets[neighbour]; !ok {
 		n.missingPackets[neighbour] = make(map[float64]struct{})
 	}
@@ -77,6 +139,9 @@ func (n *Node) addMissingPacket(neighbour string, value float64) {
 }
 
 func (n *Node) deleteMissingPacket(neighbour string, packet float64) {
+	n.missingLock.Lock()
+	defer n.missingLock.Unlock()
+
 	delete(n.missingPackets[neighbour], packet)
 
 	if len(n.missingPackets[neighbour]) == 0 {
@@ -85,69 +150,86 @@ func (n *Node) deleteMissingPacket(neighbour string, packet float64) {
 }
 
 func (n *Node) syncRPCBroadcastPacketToNeighbours(value float64, body json.RawMessage) error {
-	_, found := n.messageSet[int(value)]
-	if !found {
-		n.messageSet[int(value)] = struct{}{}
-		n.messages = append(n.messages, int(value))
+	if !n.hasMessage(int(value)) {
+		n.addToMessageSet(int(value))
+		n.addToMessages(int(value))
 
-		neighbours := n.node.NodeIDs()
+		neighbours := n.topology[n.node.ID()]
+
+		var wg sync.WaitGroup
+		wg.Add(len(neighbours))
 
 		for _, neighbour := range neighbours {
-			if n.node.ID() != neighbour {
+			dest := neighbour
+
+			go func() {
+				defer wg.Done()
+
 				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-				resp, err := n.node.SyncRPC(ctx, neighbour, body)
-				if err != nil {
-					n.addMissingPacket(neighbour, value)
-					cancel()
+				defer cancel()
 
-					continue
+				resp, err := n.node.SyncRPC(ctx, dest, body)
+				if err != nil || !checkIfMsgTypeMatches(resp.Body, "broadcast_ok") {
+					n.addMissingPacket(dest, value)
 				}
 
-				if !checkIfMsgTypeMatches(resp.Body, "broadcast_ok") {
-					n.addMissingPacket(neighbour, value)
-					cancel()
-
-					continue
-				}
-
-				cancel()
-
-				log.Printf("broadcast ok received from %v", neighbour)
-			}
+				log.Printf("broadcast ok received from %v", dest)
+			}()
 		}
+
+		wg.Wait()
+
 	}
 
 	return nil
 }
 
 func (n *Node) sendMissingPackets() {
-	body := make(map[string]any)
-	body["type"] = "broadcast"
-
 	log.Printf("send missing packets", len(n.missingPackets))
-	for neighbour, packets := range n.missingPackets {
-		for packet, _ := range packets {
-			body["message"] = packet
 
-			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-			resp, err := n.node.SyncRPC(ctx, neighbour, body)
-			if err != nil {
-				cancel()
+	var missingGroup sync.WaitGroup
+	missingGroup.Add(len(n.missingPackets))
 
-				continue
+	for neigh, packets := range n.missingPackets {
+		neighbour := neigh
+		packets := packets
+
+		go func() {
+			defer missingGroup.Done()
+
+			var packetWaitGroup sync.WaitGroup
+			packetWaitGroup.Add(len(packets))
+
+			for packet, _ := range packets {
+				packet := packet
+
+				go func() {
+					defer packetWaitGroup.Done()
+
+					body := make(map[string]any)
+					body["type"] = "broadcast"
+					body["message"] = packet
+
+					ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+					defer cancel()
+
+					resp, err := n.node.SyncRPC(ctx, neighbour, body)
+					if err != nil || !checkIfMsgTypeMatches(resp.Body, "broadcast_ok") {
+						return
+					}
+
+					n.deleteMissingPacket(neighbour, packet)
+				}()
+
 			}
 
-			if !checkIfMsgTypeMatches(resp.Body, "broadcast_ok") {
-				cancel()
+			packetWaitGroup.Wait()
 
-				continue
-			}
+		}()
 
-			cancel()
-
-			n.deleteMissingPacket(neighbour, packet)
-		}
 	}
+
+	missingGroup.Wait()
 }
 
 // broadcastPacketToNeighbours broadcasts packet only once to neighbours
@@ -213,11 +295,11 @@ func main() {
 			return errors.New("not a float64")
 		}
 
-		if err := customNode.syncRPCBroadcastPacketToNeighbours(value, msg.Body); err != nil {
+		if err := customNode.acknowledgeBroadcastPacket(msg); err != nil {
 			return err
 		}
 
-		if err := customNode.acknowledgeBroadcastPacket(msg); err != nil {
+		if err := customNode.syncRPCBroadcastPacketToNeighbours(value, msg.Body); err != nil {
 			return err
 		}
 
@@ -235,7 +317,7 @@ func main() {
 		respBody := make(map[string]any)
 
 		respBody["type"] = "read_ok"
-		respBody["messages"] = customNode.messages
+		respBody["messages"] = customNode.readMessages()
 
 		if err := node.Reply(msg, respBody); err != nil {
 			return err
@@ -259,6 +341,13 @@ func main() {
 		if err := node.Reply(msg, respBody); err != nil {
 			return err
 		}
+
+		t, ok := body["topology"]
+		if !ok {
+			return errors.New("topology not found")
+		}
+
+		customNode.initializeTopology(t)
 
 		return nil
 	})
