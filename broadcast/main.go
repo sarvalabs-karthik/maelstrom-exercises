@@ -6,6 +6,8 @@ import (
 	"errors"
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,8 +26,15 @@ import (
 // n1 can keep track of broadcast messages for which reply is not received
 // and retry sending packets every 1 second (use a goroutine which handles this
 
-// Efficient Broadcast, Part I
-// send packet only to neighbours in topology, so that no of packets in network can be reduce but this increases latency
+// Efficient Broadcast solution , Part I
+//
+//	1 (square topology) send packet only to neighbours in topology (2D manner), so that no of packets in network can be reduced but this increases latency
+//	maximum distance between any two nodes can be 2*sqrt(n)
+//	as diagonal length is sqrt(n) in a square but we travel only in 2D graph so it is 2*sqrt(n)
+//
+// 2. In tree topology maximum distance for a packet to travel will be log(n) as every node will have its child's and root as neighbours
+// no of packets emitted per operation will be n, if a packet coming from tree node then don't send the packet to root and its two child's. else send to root if coming from client
+// build the binary tree initially to identify neighbours
 
 func checkIfMsgTypeMatches(msgBody json.RawMessage, expectedType string) bool {
 	var body map[string]any
@@ -52,6 +61,77 @@ func checkIfMsgTypeMatches(msgBody json.RawMessage, expectedType string) bool {
 	return true
 }
 
+type N struct {
+	left  *N
+	right *N
+	data  int
+}
+
+func getBST(n []int) *N {
+	if len(n) == 0 {
+		return nil
+	}
+	mid := len(n) / 2
+
+	node := &N{}
+
+	node.left = getBST(n[:mid])
+	node.right = getBST(n[mid+1:])
+	node.data = n[mid]
+
+	return node
+}
+
+func findChildren(tree *N, n int) []int {
+	if n == tree.data {
+		childs := make([]int, 0)
+
+		if tree.left != nil {
+			childs = append(childs, tree.left.data)
+		}
+
+		if tree.right != nil {
+			childs = append(childs, tree.right.data)
+		}
+
+		return childs
+	}
+
+	if n > tree.data {
+		return findChildren(tree.right, n)
+	}
+
+	return findChildren(tree.left, n)
+}
+
+func ISClient(n string) bool {
+	return !strings.HasPrefix(n, "n")
+}
+
+func getNodeFromNumber(n int) string {
+	return "n" + strconv.Itoa(n)
+}
+
+func getNumberFromNode(node string) int {
+	num := strings.TrimPrefix(node, "n")
+	val, err := strconv.Atoi(num)
+	if err != nil {
+		panic(err)
+	}
+
+	return val
+}
+
+func getNodesFromNumbers(numbers []int) []string {
+	childs := make([]string, 0)
+
+	for _, n := range numbers {
+		childs = append(childs, getNodeFromNumber(n))
+	}
+
+	return childs
+}
+
 type Node struct {
 	node           *maelstrom.Node
 	messages       []int
@@ -61,6 +141,8 @@ type Node struct {
 	msgLock        sync.RWMutex
 	messageSetLock sync.RWMutex
 	topology       map[string][]string
+	children       []string
+	root           []string
 }
 
 func newNode(node *maelstrom.Node) *Node {
@@ -70,6 +152,7 @@ func newNode(node *maelstrom.Node) *Node {
 		messageSet:     make(map[int]struct{}),
 		missingPackets: make(map[string]map[float64]struct{}),
 		topology:       make(map[string][]string),
+		root:           make([]string, 0),
 	}
 }
 
@@ -93,6 +176,21 @@ func (n *Node) initializeTopology(t any) {
 
 		n.topology[src] = neigh
 	}
+
+	nodes := n.node.NodeIDs()
+
+	nodeList := make([]int, len(nodes))
+
+	for i := 0; i < len(nodes); i++ {
+		nodeList[i] = i
+	}
+
+	bst := getBST(nodeList)
+	n.root = append(n.root, getNodeFromNumber(bst.data))
+	n.root = append(n.root, getNodeFromNumber(bst.right.data))
+	n.root = append(n.root, getNodeFromNumber(bst.left.data))
+
+	n.children = getNodesFromNumbers(findChildren(bst, getNumberFromNode(n.node.ID())))
 }
 
 func (n *Node) addToMessageSet(val int) {
@@ -147,6 +245,54 @@ func (n *Node) deleteMissingPacket(neighbour string, packet float64) {
 	if len(n.missingPackets[neighbour]) == 0 {
 		delete(n.missingPackets, neighbour)
 	}
+}
+
+// syncRPCBroadcastPacketInTree: all nodes should send messages to child nodes and also when nodes get msg from client,
+// they should send it to root and its two child's, to decrease the latency by 1 step
+// root cannot choose root and its children as neighbours when it received message from client
+// when msg comes from non-client then root shouldn't send them to children as non-client will send them anyway
+func (n *Node) syncRPCBroadcastPacketInTree(value float64, msg maelstrom.Message) error {
+	if !n.hasMessage(int(value)) {
+		n.addToMessageSet(int(value))
+		n.addToMessages(int(value))
+
+		if n.node.ID() == n.root[0] && !ISClient(msg.Src) {
+			return nil
+		}
+
+		neighbours := n.children
+
+		if ISClient(msg.Src) && n.node.ID() != n.root[0] {
+			neighbours = append(neighbours, n.root...)
+			neighbours = append(neighbours, n.root...)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(len(neighbours))
+
+		for _, neighbour := range neighbours {
+			dest := neighbour
+
+			go func() {
+				defer wg.Done()
+
+				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+				defer cancel()
+
+				resp, err := n.node.SyncRPC(ctx, dest, msg.Body)
+				if err != nil || !checkIfMsgTypeMatches(resp.Body, "broadcast_ok") {
+					n.addMissingPacket(dest, value)
+				}
+
+				log.Printf("broadcast ok received from %v", dest)
+			}()
+		}
+
+		wg.Wait()
+
+	}
+
+	return nil
 }
 
 func (n *Node) syncRPCBroadcastPacketToNeighbours(value float64, body json.RawMessage) error {
@@ -299,7 +445,7 @@ func main() {
 			return err
 		}
 
-		if err := customNode.syncRPCBroadcastPacketToNeighbours(value, msg.Body); err != nil {
+		if err := customNode.syncRPCBroadcastPacketInTree(value, msg); err != nil {
 			return err
 		}
 
