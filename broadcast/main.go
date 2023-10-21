@@ -36,6 +36,13 @@ import (
 // no of packets emitted per operation will be n, if a packet coming from tree node then don't send the packet to root and its two child's. else send to root if coming from client
 // build the binary tree initially to identify neighbours
 
+// Efficient Broadcast solution, Part 2
+// batch the requests as they come and run a go routine to send packets every 500 milliseconds once
+// when packet comes from client for first time, it can be sent immediately
+
+var maxRetry = 100
+var readIDs = "readIDs"
+
 func checkIfMsgTypeMatches(msgBody json.RawMessage, expectedType string) bool {
 	var body map[string]any
 
@@ -133,24 +140,24 @@ func getNodesFromNumbers(numbers []int) []string {
 }
 
 type Node struct {
-	node           *maelstrom.Node
-	messages       []int
-	messageSet     map[int]struct{}
-	missingPackets map[string]map[float64]struct{} // map of node to array of packet to be resent at regular intervals
-	missingLock    sync.Mutex
-	msgLock        sync.RWMutex
-	messageSetLock sync.RWMutex
-	topology       map[string][]string
-	children       []string
-	root           []string
+	node               *maelstrom.Node
+	unsentIDs          []float64
+	unsentIDsLock      sync.RWMutex
+	receivedIDs        []int
+	receivedIDsSet     map[int]struct{}
+	receivedIDsLock    sync.RWMutex
+	receivedIDsSetLock sync.RWMutex
+	topology           map[string][]string
+	children           []string
+	root               []string
 }
 
 func newNode(node *maelstrom.Node) *Node {
 	return &Node{
 		node:           node,
-		messages:       make([]int, 0),
-		messageSet:     make(map[int]struct{}),
-		missingPackets: make(map[string]map[float64]struct{}),
+		receivedIDs:    make([]int, 0),
+		receivedIDsSet: make(map[int]struct{}),
+		unsentIDs:      make([]float64, 0),
 		topology:       make(map[string][]string),
 		root:           make([]string, 0),
 	}
@@ -190,200 +197,158 @@ func (n *Node) initializeTopology(t any) {
 	n.root = append(n.root, getNodeFromNumber(bst.right.data))
 	n.root = append(n.root, getNodeFromNumber(bst.left.data))
 
+	log.Println("root ", n.root)
 	n.children = getNodesFromNumbers(findChildren(bst, getNumberFromNode(n.node.ID())))
+	log.Println("childs ", n.children)
 }
 
-func (n *Node) addToMessageSet(val int) {
-	n.messageSetLock.Lock()
-	defer n.messageSetLock.Unlock()
+func (n *Node) addToReceivedIDsSet(val int) {
+	n.receivedIDsSetLock.Lock()
+	defer n.receivedIDsSetLock.Unlock()
 
-	n.messageSet[val] = struct{}{}
+	n.receivedIDsSet[val] = struct{}{}
 }
 
-func (n *Node) hasMessage(val int) bool {
-	n.messageSetLock.RLock()
-	defer n.messageSetLock.RUnlock()
+func (n *Node) hasID(val int) bool {
+	n.receivedIDsSetLock.RLock()
+	defer n.receivedIDsSetLock.RUnlock()
 
-	_, found := n.messageSet[val]
+	_, found := n.receivedIDsSet[val]
 
 	return found
 }
 
-func (n *Node) addToMessages(val int) {
-	n.msgLock.Lock()
-	defer n.msgLock.Unlock()
+func (n *Node) addToReceivedIDs(val int) {
+	n.receivedIDsLock.Lock()
+	defer n.receivedIDsLock.Unlock()
 
-	n.messages = append(n.messages, val)
+	n.receivedIDs = append(n.receivedIDs, val)
 }
 
-func (n *Node) readMessages() []int {
-	n.msgLock.RLock()
-	defer n.msgLock.RUnlock()
+func (n *Node) readReceivedIDS() []int {
+	n.receivedIDsLock.RLock()
+	defer n.receivedIDsLock.RUnlock()
 
-	return n.messages
+	return n.receivedIDs
 }
 
-func (n *Node) addMissingPacket(neighbour string, value float64) {
-	n.missingLock.Lock()
-	defer n.missingLock.Unlock()
+func (n *Node) addToUnsentIDs(val int) {
+	n.unsentIDsLock.Lock()
+	defer n.unsentIDsLock.Unlock()
 
-	log.Printf("add missing packet %s, %v, %v ", neighbour, value, len(n.missingPackets))
+	log.Println("ajinkya add to unsent ids ", val)
+	n.unsentIDs = append(n.unsentIDs, float64(val))
+}
 
-	if _, ok := n.missingPackets[neighbour]; !ok {
-		n.missingPackets[neighbour] = make(map[float64]struct{})
+// syncRPCBroadcastMultiplePacketInTree: all nodes should send messages to child nodes
+// when msg comes from non-client then root shouldn't send them to children as non-client will send them anyway
+func (n *Node) syncRPCBroadcastMultiplePacketInTree(body json.RawMessage) error {
+	neighbours := n.children
+
+	for _, neighbour := range neighbours {
+		dest := neighbour
+
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			for i := 0; i < maxRetry; i++ {
+				_, err := n.node.SyncRPC(ctx, dest, body)
+				if err != nil {
+					time.Sleep(250 * time.Millisecond)
+
+					continue
+				}
+
+				break
+			}
+
+			log.Printf("broadcast ok received from %v", dest)
+		}()
 	}
 
-	n.missingPackets[neighbour][value] = struct{}{}
-}
-
-func (n *Node) deleteMissingPacket(neighbour string, packet float64) {
-	n.missingLock.Lock()
-	defer n.missingLock.Unlock()
-
-	delete(n.missingPackets[neighbour], packet)
-
-	if len(n.missingPackets[neighbour]) == 0 {
-		delete(n.missingPackets, neighbour)
-	}
+	return nil
 }
 
 // syncRPCBroadcastPacketInTree: all nodes should send messages to child nodes and also when nodes get msg from client,
 // they should send it to root and its two child's, to decrease the latency by 1 step
 // root cannot choose root and its children as neighbours when it received message from client
 // when msg comes from non-client then root shouldn't send them to children as non-client will send them anyway
-func (n *Node) syncRPCBroadcastPacketInTree(value float64, msg maelstrom.Message) error {
-	if !n.hasMessage(int(value)) {
-		n.addToMessageSet(int(value))
-		n.addToMessages(int(value))
+func (n *Node) syncRPCBroadcastPacketInTree(msg maelstrom.Message) error {
+	neighbours := n.children
 
-		if n.node.ID() == n.root[0] && !ISClient(msg.Src) {
-			return nil
-		}
-
-		neighbours := n.children
-
-		if ISClient(msg.Src) && n.node.ID() != n.root[0] {
-			neighbours = append(neighbours, n.root...)
-			neighbours = append(neighbours, n.root...)
-		}
-
-		var wg sync.WaitGroup
-		wg.Add(len(neighbours))
-
-		for _, neighbour := range neighbours {
-			dest := neighbour
-
-			go func() {
-				defer wg.Done()
-
-				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-				defer cancel()
-
-				resp, err := n.node.SyncRPC(ctx, dest, msg.Body)
-				if err != nil || !checkIfMsgTypeMatches(resp.Body, "broadcast_ok") {
-					n.addMissingPacket(dest, value)
-				}
-
-				log.Printf("broadcast ok received from %v", dest)
-			}()
-		}
-
-		wg.Wait()
-
+	if n.node.ID() != n.root[0] {
+		neighbours = append(neighbours, n.root...)
 	}
 
-	return nil
-}
-
-func (n *Node) syncRPCBroadcastPacketToNeighbours(value float64, body json.RawMessage) error {
-	if !n.hasMessage(int(value)) {
-		n.addToMessageSet(int(value))
-		n.addToMessages(int(value))
-
-		neighbours := n.topology[n.node.ID()]
-
-		var wg sync.WaitGroup
-		wg.Add(len(neighbours))
-
-		for _, neighbour := range neighbours {
-			dest := neighbour
-
-			go func() {
-				defer wg.Done()
-
-				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-				defer cancel()
-
-				resp, err := n.node.SyncRPC(ctx, dest, body)
-				if err != nil || !checkIfMsgTypeMatches(resp.Body, "broadcast_ok") {
-					n.addMissingPacket(dest, value)
-				}
-
-				log.Printf("broadcast ok received from %v", dest)
-			}()
-		}
-
-		wg.Wait()
-
-	}
-
-	return nil
-}
-
-func (n *Node) sendMissingPackets() {
-	log.Printf("send missing packets", len(n.missingPackets))
-
-	var missingGroup sync.WaitGroup
-	missingGroup.Add(len(n.missingPackets))
-
-	for neigh, packets := range n.missingPackets {
-		neighbour := neigh
-		packets := packets
+	for _, neighbour := range neighbours {
+		dest := neighbour
 
 		go func() {
-			defer missingGroup.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancel()
 
-			var packetWaitGroup sync.WaitGroup
-			packetWaitGroup.Add(len(packets))
+			for i := 0; i < maxRetry; i++ {
+				_, err := n.node.SyncRPC(ctx, dest, msg.Body)
+				if err != nil {
+					time.Sleep(500 * time.Millisecond)
 
-			for packet, _ := range packets {
-				packet := packet
+					log.Println("send again ")
+					continue
+				}
 
-				go func() {
-					defer packetWaitGroup.Done()
-
-					body := make(map[string]any)
-					body["type"] = "broadcast"
-					body["message"] = packet
-
-					ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-					defer cancel()
-
-					resp, err := n.node.SyncRPC(ctx, neighbour, body)
-					if err != nil || !checkIfMsgTypeMatches(resp.Body, "broadcast_ok") {
-						return
-					}
-
-					n.deleteMissingPacket(neighbour, packet)
-				}()
-
+				break
 			}
 
-			packetWaitGroup.Wait()
-
+			log.Printf("broadcast ok received from %v", dest)
 		}()
-
 	}
 
-	missingGroup.Wait()
+	return nil
 }
+
+//
+//func (n *Node) syncRPCBroadcastPacketToNeighbours(value float64, body json.RawMessage) error {
+//	if !n.hasID(int(value)) {
+//		n.addToReceivedIDsSet(int(value))
+//		n.addToReceivedIDs(int(value))
+//
+//		neighbours := n.topology[n.node.ID()]
+//
+//		var wg sync.WaitGroup
+//		wg.Add(len(neighbours))
+//
+//		for _, neighbour := range neighbours {
+//			dest := neighbour
+//
+//			go func() {
+//				defer wg.Done()
+//
+//				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+//				defer cancel()
+//
+//				resp, err := n.node.SyncRPC(ctx, dest, body)
+//				if err != nil || !checkIfMsgTypeMatches(resp.Body, "broadcast_ok") {
+//					n.addMissingPacket(dest, value)
+//				}
+//
+//				log.Printf("broadcast ok received from %v", dest)
+//			}()
+//		}
+//
+//		wg.Wait()
+//
+//	}
+//
+//	return nil
+//}
 
 // broadcastPacketToNeighbours broadcasts packet only once to neighbours
 func (n *Node) broadcastPacketToNeighbours(value float64, body json.RawMessage) error {
-	_, found := n.messageSet[int(value)]
+	_, found := n.receivedIDsSet[int(value)]
 	if !found {
-		n.messageSet[int(value)] = struct{}{}
-		n.messages = append(n.messages, int(value))
+		n.receivedIDsSet[int(value)] = struct{}{}
+		n.receivedIDs = append(n.receivedIDs, int(value))
 
 		neighbours := n.node.NodeIDs()
 
@@ -410,6 +375,58 @@ func (n *Node) acknowledgeBroadcastPacket(msg maelstrom.Message) error {
 	return nil
 }
 
+func (n *Node) SendUnsentPackets() error {
+	n.unsentIDsLock.Lock()
+	defer n.unsentIDsLock.Unlock()
+
+	vals := n.unsentIDs
+
+	res := make(map[string]any)
+
+	res["type"] = "broadcast"
+	res[readIDs] = vals
+
+	rawBody, err := json.Marshal(res)
+	if err != nil {
+		return err
+	}
+
+	if err := n.syncRPCBroadcastMultiplePacketInTree(rawBody); err != nil {
+		return err
+	}
+
+	n.unsentIDs = make([]float64, 0)
+
+	return nil
+}
+
+func convertToINTList(b json.RawMessage) ([]int, error) {
+	var body map[string]any
+
+	err := json.Unmarshal(b, &body)
+	if err != nil {
+		return nil, err
+	}
+
+	val, ok := body[readIDs]
+	if !ok {
+		return nil, errors.New("message type doesn't exist")
+	}
+
+	vals, ok := val.([]interface{})
+	if !ok {
+		log.Panic("neighbours are not string list")
+	}
+
+	result := make([]int, 0, len(vals))
+
+	for _, v := range vals {
+		result = append(result, int(v.(float64)))
+	}
+
+	return result, nil
+}
+
 func main() {
 	node := maelstrom.NewNode()
 	customNode := newNode(node)
@@ -417,8 +434,8 @@ func main() {
 	go func() {
 		for {
 			select {
-			case <-time.After(1 * time.Second):
-				customNode.sendMissingPackets()
+			case <-time.After(500 * time.Millisecond):
+				customNode.SendUnsentPackets()
 			}
 		}
 	}()
@@ -431,22 +448,54 @@ func main() {
 			return err
 		}
 
-		val, ok := body["message"]
-		if !ok {
-			return errors.New("message type doesn't exist")
-		}
-
-		value, ok := val.(float64)
-		if !ok {
-			return errors.New("not a float64")
-		}
-
 		if err := customNode.acknowledgeBroadcastPacket(msg); err != nil {
 			return err
 		}
 
-		if err := customNode.syncRPCBroadcastPacketInTree(value, msg); err != nil {
+		_, ok := body[readIDs]
+		if !ok {
+			val, ok := body["message"]
+			if !ok {
+				return errors.New("message type doesn't exist")
+			}
+
+			value, ok := val.(float64)
+			if !ok {
+				return errors.New("not a float64")
+			}
+
+			if !customNode.hasID(int(value)) {
+				customNode.addToReceivedIDsSet(int(value))
+				customNode.addToReceivedIDs(int(value))
+			}
+
+			body[readIDs] = []float64{value}
+
+			rawBody, err := json.Marshal(body)
+			if err != nil {
+				return err
+			}
+
+			msg.Body = rawBody
+
+			if err := customNode.syncRPCBroadcastPacketInTree(msg); err != nil {
+				return err
+			}
+
+			return nil
+		}
+
+		values, err := convertToINTList(msg.Body)
+		if err != nil {
 			return err
+		}
+
+		for _, v := range values {
+			if !customNode.hasID(v) {
+				customNode.addToReceivedIDsSet(v)
+				customNode.addToReceivedIDs(v)
+				customNode.addToUnsentIDs(v)
+			}
 		}
 
 		return nil
@@ -463,7 +512,7 @@ func main() {
 		respBody := make(map[string]any)
 
 		respBody["type"] = "read_ok"
-		respBody["messages"] = customNode.readMessages()
+		respBody["messages"] = customNode.readReceivedIDS()
 
 		if err := node.Reply(msg, respBody); err != nil {
 			return err
